@@ -1,0 +1,5 @@
+yahoofinancials
+flask
+Flask-SocketIO
+flask-cors
+simple-websocket
