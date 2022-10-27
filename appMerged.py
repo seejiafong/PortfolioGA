@@ -53,21 +53,26 @@ def get_db_connection():
     return conn
 
 def pullFromDatabase(tickers, startdate, enddate):
-    print("In pullFromDatabase")
     con = sqlite3.connect(dbName)
-    #con.row_factory = sqlite3.Row
     cur = con.cursor()
     sqlSelect = "SELECT ticker, date, close, dailyreturn FROM alltickers where ticker in ("
     for ticker in tickers:
         sqlSelect = sqlSelect+"\'" + ticker+"\',"
     sqlSelect = sqlSelect.strip(',')+ ") and date>=\'" + startdate + "\' and date<=\'" + enddate +"\'"
-    #print(sqlSelect)
     res = cur.execute(sqlSelect)
     data = res.fetchall()
     cur.close()
     con.close()
-    print("Data Fetched")
-    #print(data)
+    return data
+
+def pullFromTreasury(startdate, enddate):
+    con = sqlite3.connect(dbName)
+    cur = con.cursor()
+    sqlSelect = "SELECT avg(AdjClose) FROM treasury where date>=\'" + startdate + "\' and date<=\'" + enddate +"\'"
+    res = cur.execute(sqlSelect)
+    data = res.fetchall()
+    cur.close()
+    con.close()
     return data
 
 def dateToTimestamp(datestr):
@@ -120,21 +125,18 @@ def getPortfolioStandardDeviation(portfolio, startdate, enddate):
     for i in range(len(tickers)):
         for j in range(len(tickers)):
             if (i==j):
-                continue #assume covariance = 0 hence the term 2*w1*w2*sigma1*sigma2*cov(ticker1, ticker2) will be 0
+                continue #assume covariance = 0 hence the term 2*w1*w2*cov(ticker1, ticker2) will be 0
             w1=tickersAlloc[i]
             w2=tickersAlloc[j]
-            sigma1=getStandardDeviationForTicker(portfolioValues, tickers[i])
-            sigma2=getStandardDeviationForTicker(portfolioValues, tickers[j])
             cov=cov_matrix[tickers[i]][tickers[j]]
-            #print('pt 2 ', i,' ',j,': [w1]', w1, ', [w2]', w2, ', [sg1]', sigma1, ', [sg2]', sigma2, ', cov', cov)
-            part_2 += w1*w2*sigma1*sigma2*cov
-    #print ('pt 2 summation ' , part_2)  
+            part_2 += w1*w2*cov
     portfolioVariance = part_1+part_2
     return (portfolioVariance ** 0.5) * (numTradeDays**0.5)
 
 #Annual Basis
-def getRiskFreeRate():
-    return 0.0697
+def getRiskFreeRate(startdate, enddate):
+    data = pullFromTreasury(startdate, enddate)
+    return data[0][0] * 0.01
 
 def getSharpeRatio(totalReturnPercentage, riskFreeRate, stddev):
     return (totalReturnPercentage-riskFreeRate) / stddev
@@ -145,15 +147,8 @@ def computeFitnessValue(portfolio, startdate, enddate):
     portfolioValues = fetchPortfolio(tickers, startdate, enddate)
     totalRetDailyAnnualized = getAnnualizedWeightedAvgDailyReturn(portfolio, portfolioValues)
     stddevRetDailyAnnualized = getPortfolioStandardDeviation(portfolio, startdate, enddate)
-    sharpeRatio = getSharpeRatio(totalRetDailyAnnualized, getRiskFreeRate(), stddevRetDailyAnnualized)
-    return sharpeRatio
-
-def computeFitnessValueAndAppend(portfolio, startdate, enddate):
-    sharpeRatio = computeFitnessValue(portfolio, startdate, enddate)
-    new_portfolio = pd.DataFrame(portfolio)
-    new_portfolio['sharpe'] = sharpeRatio
-    return new_portfolio
-      
+    sharpeRatio = getSharpeRatio(totalRetDailyAnnualized, getRiskFreeRate(startdate, enddate), stddevRetDailyAnnualized)
+    return sharpeRatio, stddevRetDailyAnnualized
     
 #isSingleRow = boolean denoting if we are only inserting 1 row of data
 def insert(table_name, value_tuple, isSingleRow):
@@ -193,31 +188,20 @@ def chromosome(n, totalstocks):
     ''' Generates set of random numbers whose sum is equal to 1
         Input: n = number of stocks we want to invest out of totalstocks. totalstocks = universe of investible stocks
         Output: Array of random numbers'''
-    #print("In Chromosome") # n = 10, totalstocks = 2
     n = np.minimum(n,totalstocks)
-    #print("n:", n)
     ch = np.random.rand(n)
     ch = ch/sum(ch)
-    #print("ch : ", ch)
-    #disperse ch across the available stocks
     portfolio = [0] * totalstocks
     i = 0
-    #print("portfolio:",portfolio) #[0,0]
     while (i < n):
-        #print("i in chromosome", i)
-        #look for portfolio[index] == 0 to replace with chromosome
         index = np.random.randint(0, totalstocks)
-        #print("index", index)
-        #print("portfolio[index]", portfolio[index])
         if (portfolio[index] == 0):
             portfolio[index] = ch[i]
             i = i + 1
-    #print("portfolio in chromosome",portfolio)
     return portfolio
     
 # Generate population
 def generatePopulation(pop_size, stocktickers, maxStocks):
-    #print("In generatePopulation")
     totalstocks = len(stocktickers)
     print("totalStocks : ", totalstocks)
     population = np.array([chromosome(maxStocks, totalstocks) for _ in range(pop_size)])
@@ -227,10 +211,10 @@ def toPortfolioDataframe(stocktickers, chromosome):
     return pd.DataFrame({'ticker':stocktickers, 'alloc':chromosome})    
         
 def selectElitePopulation(stocktickers, population, selectionRate, startdate, enddate, runId, epoch,reqId='',publishToFrontend=False):
-    #print("In selectElitePopulation")
     pool = mp.Pool(mp.cpu_count())
     n_chromosomes = len(population)
     population_fitness = [] 
+    population_risk = []
     x1 = len(stocktickers)
     #convert all chromosomes to portfolio dataframes
     populationDFs =[]
@@ -243,11 +227,15 @@ def selectElitePopulation(stocktickers, population, selectionRate, startdate, en
     pool.close()
     pool.join()
     
+    chrLen = len(population[0])
     for i in range(len(pool_outputs)):
-        population_fitness.append(pool_outputs[i].get())
-    population = np.insert(population, x1, population_fitness, axis=1)
-    population = sorted(population,key = lambda x: x[x1],reverse=True)
-    writeGAPopulation(enddate, runId, epoch, population)
+        sharpe = pool_outputs[i].get()[0]
+        risk = pool_outputs[i].get()[1]
+        population_fitness.append(sharpe)
+        population_risk.append(risk)
+    population = np.insert(population, chrLen, population_fitness, axis=1)
+    population = sorted(population,key = lambda x: x[chrLen],reverse=True)
+    writeGAPopulation(enddate, runId, epoch, population, population_risk)
     if (publishToFrontend==True):
     	sendGAEpochToFrontend(enddate, runId, epoch, stocktickers, population,reqId)
     percentage_elite_idx = int(np.floor(len(population)* selectionRate))
@@ -264,11 +252,9 @@ def mutation(parent):
     return child    
         
 def crossover(parent1, parent2, maxStocks=10):
-    #print("In crossover")
     length = len(parent1)
     crossoverPt = np.random.randint(0, length)
     child = [0] * length
-    #print('crossover Pt', crossoverPt)
     numStocks = 0
     stockLoc = []
     for i in range(length):
@@ -331,21 +317,21 @@ def mutateOrCrossover(j, new_population, crossoverRate, mutationRate):
     
 def writeGAHyperparameters(runId, pop_size, stocktickers, maxStocks, maxIterations, selectionRate, crossoverRate, mutationRate, 
           startdate, enddate):
-    value_tuple = (enddate, runId, startdate, enddate, str(stocktickers), maxStocks, maxIterations, selectionRate, mutationRate, crossoverRate)
+    value_tuple = (enddate, runId, pop_size, startdate, enddate, str(stocktickers), maxStocks, maxIterations, selectionRate, mutationRate, crossoverRate)
     #print(value_tuple)
     insert('gahyperparams', value_tuple, True)
 
 def writeGAResults(date, runId, epoch, stockName,chromosome, sharpe, risk):
     returns = sharpe * risk
     value_tuple = (date, runId, epoch,str(stockName), str(chromosome), sharpe, returns, risk)
-    #print(value_tuple)
     insert('garesults', value_tuple, True)
 
-def writeGAPopulation(date, runId, epoch, population):
+def writeGAPopulation(date, runId, epoch, population, population_risk):
     formatted_list = []
     populationLen = len(population[0])
     for i in range(len(population)):
-        formatted_list.append((date, runId, epoch, i, str(population[i][0:populationLen-1]), population[i][populationLen-1:][0]))
+        formatted_list.append((date, runId, epoch, i, str(population[i][0:populationLen-1]), 
+                               population[i][populationLen-1:][0], population_risk[i]))
     value_tuple = [tuple(item) for item in formatted_list]
     insert('gapopulation', value_tuple, False)
 
@@ -393,7 +379,6 @@ def initialize(stocktickers, startdate, enddate, depth):
         print(stocktickers)
         database = pd.DataFrame(pullFromDatabase(stocktickers, startdate, enddate))
         database.columns = ['ticker','date', 'price', 'dailyreturn']
-        database.head()
 
 
 def runGA(pop_size, stocktickers, maxStocks, maxIterations, selectionRate, crossoverRate, mutationRate, startdate, enddate, depth, maxDepth=5, runId='', reqId=''):
@@ -422,8 +407,9 @@ def runGA(pop_size, stocktickers, maxStocks, maxIterations, selectionRate, cross
         print(' distance ... ', distance, ' elite ', elite, ' prevElite ', prevElite)
         prevElite = elite
         topElite = toPortfolioDataframe(stocktickers, elite[0])
-        sharpeRatio=computeFitnessValue(topElite, startdate, enddate)
-        expectedRisk = getPortfolioStandardDeviation(topElite, startdate, enddate)
+        sharpeRatioResult=computeFitnessValue(topElite, startdate, enddate)
+        sharpeRatio = sharpeRatioResult[0]
+        expectedRisk = sharpeRatioResult[1] 
         print('Current Sharpe Ratio {} Expected Risk {}\n'.format(sharpeRatio, expectedRisk))
         #print('TopElite: ', topElite)
         if (distance < 0.0001):
@@ -826,39 +812,8 @@ def getLSTM():
     df.to_sql(table_name, conn, if_exists='replace', index = False)
 
     
-    
-
-    
-    
-
-  
-@app.route('/')
-def hello_world():
-    return("Hello World")        
+          
         
-
-    
-@app.route('/index/', methods=('GET', 'POST'))
-def index():
-    if request.method == 'POST':
-        stocktickers = []
-        ticker1 = request.form['ticker1']
-        stocktickers.append(ticker1)
-        ticker2 = request.form['ticker2']
-        stocktickers.append(ticker2)
-        ticker3 = request.form['ticker3']
-        stocktickers.append(ticker3)
-        ticker4 = request.form['ticker4']
-        stocktickers.append(ticker4)
-        ticker5 = request.form['ticker5']
-        stocktickers.append(ticker5)
-
-        runGA(10, stocktickers, 10, 40, 0.3, 0.6, 0.6, '2021-09-27', '2022-10-05',0,1)
-        #print(stockName,allocationPerc)
-        #return render_template('index.html', stock = stockName, alloc = allocationPerc)
-    return render_template('index.html')
-    
-    
 @app.route('/customga', methods = ["POST"])
 def customga():
     req = request.get_json(silent=False, force=True)
@@ -953,7 +908,7 @@ def dbRecordsDelete():
     """ DELETE DATABASE RECORDS FOR ALL THE STOCK TICKERS FOR THE TIME MENTIONED"""
     con = sqlite3.connect('stocks.db')
     cur = con.cursor()
-    sqlSelect = "delete FROM alltickers where date>= '2022-10-21'and date <= '2022-10-21' "
+    sqlSelect = "delete FROM alltickers where date>= '2022-10-26'and date <= '2022-10-26' "
     print(sqlSelect)
     res = cur.execute(sqlSelect)
     con.commit()
